@@ -29,8 +29,7 @@
  *
  *
  * the protocol spec at
- *  http://public.logicacmg.com/~redferni/mysql/MySQL-Protocol.html
- *  http://forge.mysql.com/wiki/MySQL_Internals_ClientServer_Protocol
+ *  http://dev.mysql.com/doc/internals/en/client-server-protocol.html
  * and MySQL source code
  */
 
@@ -86,8 +85,13 @@ void proto_reg_handoff_mysql(void);
 #define MYSQL_FLD_SET_FLAG            0x0800
 
 /* extended capabilities: 4.1+ client only */
-#define MYSQL_CAPS_MS 0x0001
+#define MYSQL_CAPS_MS 0x0001 //
 #define MYSQL_CAPS_MR 0x0002
+#define MYSQL_CAPS_PS_MULTI_RESULTS               0x0004
+#define MYSQL_CAPS_PLUGIN_AUTH                    0x0008
+#define MYSQL_CAPS_CONNECT_ATTRS                  0x0010
+#define MYSQL_CAPS_PLUGIN_AUTH_LENENC_CLIENT_DATA 0x0020
+
 
 /* status bitfield */
 #define MYSQL_STAT_IT 0x0001
@@ -447,6 +451,7 @@ static int hf_mysql_max_packet = -1;
 static int hf_mysql_user = -1;
 static int hf_mysql_table_name = -1;
 static int hf_mysql_schema = -1;
+static int hf_mysql_auth_plugin_name = -1;
 static int hf_mysql_thread_id  = -1;
 static int hf_mysql_salt = -1;
 static int hf_mysql_salt2 = -1;
@@ -520,6 +525,15 @@ static int hf_mysql_exec_field_float = -1;
 static int hf_mysql_exec_field_time_length = -1;
 static int hf_mysql_exec_field_time_sign = -1;
 static int hf_mysql_exec_field_time_days = -1;
+static int hf_mysql_dump_database = -1;
+static int hf_mysql_dump_table = -1;
+static int hf_mysql_slave_server_id = -1;
+static int hf_mysql_slave_hostname = -1;
+static int hf_mysql_slave_user = -1;
+static int hf_mysql_slave_password = -1;
+static int hf_mysql_slave_port = -1;
+static int hf_mysql_slave_replication_rank = -1;
+static int hf_mysql_slave_master_id = -1;
 
 static expert_field ei_mysql_eof = EI_INIT;
 static expert_field ei_mysql_dissector_incomplete = EI_INIT;
@@ -817,6 +831,17 @@ mysql_dissect_login(tvbuff_t *tvb, packet_info *pinfo, int offset,
 		col_append_fstr(pinfo->cinfo, COL_INFO, " db=%s", tvb_get_string(wmem_packet_scope(), tvb, offset, lenstr));
 
 		proto_tree_add_item(login_tree, hf_mysql_schema, tvb, offset, lenstr, ENC_ASCII|ENC_NA);
+		offset += lenstr;
+	}
+
+	if (conn_data->clnt_caps & MYSQL_CAPS_PLUGIN_AUTH)
+	{
+		lenstr=my_tvb_strsize(tvb, offset);
+		if(lenstr < 0) {
+			return offset;
+		}
+
+		proto_tree_add_item(login_tree, hf_mysql_auth_plugin_name, tvb, offset, lenstr, ENC_ASCII);
 		offset += lenstr;
 	}
 
@@ -1254,16 +1279,50 @@ mysql_dissect_request(tvbuff_t *tvb,packet_info *pinfo, int offset,
 
 		conn_data->state = REQUEST;
 		break;
-/* FIXME: implement replication packets */
 	case MYSQL_TABLE_DUMP:
-	case MYSQL_CONNECT_OUT:
-	case MYSQL_REGISTER_SLAVE:
-		ti = proto_tree_add_item(req_tree, hf_mysql_payload, tvb, offset, -1, ENC_NA);
-		expert_add_info_format(pinfo, ti, &ei_mysql_dissector_incomplete, "FIXME: implement replication packets");
-		offset += tvb_reported_length_remaining(tvb, offset);
+		tvb_memcpy(tvb, &lenstr, offset, 1);
+		offset += 1;
+		proto_tree_add_item(req_tree, hf_mysql_dump_database, tvb, offset, lenstr, ENC_ASCII);
+
+		tvb_memcpy(tvb, &lenstr, offset, 1);
+		offset += 1;
+		proto_tree_add_item(req_tree, hf_mysql_dump_table, tvb, offset, lenstr, ENC_ASCII);
+
 		conn_data->state = REQUEST;
 		break;
+	case MYSQL_CONNECT_OUT:
+		conn_data->state = REQUEST;
+		break;
+	case MYSQL_REGISTER_SLAVE:
+		proto_tree_add_item(req_tree, hf_mysql_slave_server_id, tvb, offset, 4, ENC_LITTLE_ENDIAN);
+		offset += 4;
 
+		tvb_memcpy(tvb, &lenstr, offset, 1);
+		offset += 1;
+		proto_tree_add_item(req_tree, hf_mysql_slave_hostname, tvb, offset, lenstr, ENC_ASCII);
+		offset += lenstr;
+
+		tvb_memcpy(tvb, &lenstr, offset, 1);
+		offset += 1;
+		proto_tree_add_item(req_tree, hf_mysql_slave_user, tvb, offset, lenstr, ENC_ASCII);
+		offset += lenstr;
+
+		tvb_memcpy(tvb, &lenstr, offset, 1);
+		offset += 1;
+		proto_tree_add_item(req_tree, hf_mysql_slave_password, tvb, offset, lenstr, ENC_ASCII);
+		offset += lenstr;
+
+		proto_tree_add_item(req_tree, hf_mysql_slave_port, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+		offset += 2;
+
+		proto_tree_add_item(req_tree, hf_mysql_slave_replication_rank, tvb, offset, 4, ENC_LITTLE_ENDIAN);
+		offset += 4;
+
+		proto_tree_add_item(req_tree, hf_mysql_slave_master_id, tvb, offset, 4, ENC_LITTLE_ENDIAN);
+		offset += 4;
+
+		conn_data->state = REQUEST;
+		break;
 	default:
 		ti = proto_tree_add_item(req_tree, hf_mysql_payload, tvb, offset, -1, ENC_NA);
 		expert_add_info(pinfo, ti, &ei_mysql_command);
@@ -2147,6 +2206,11 @@ void proto_register_mysql(void)
 		FT_STRING, BASE_NONE, NULL, 0x0,
 		"Login Schema", HFILL }},
 
+		{ &hf_mysql_auth_plugin_name,
+		{ "Auth Plugin Name", "mysql.auth_plugin_name",
+		FT_STRINGZ, BASE_NONE, NULL, 0x0,
+		"Login Auth Plugin Name", HFILL }},
+
 		{ &hf_mysql_salt,
 		{ "Salt", "mysql.salt",
 		FT_STRINGZ, BASE_NONE, NULL, 0x0,
@@ -2616,6 +2680,43 @@ void proto_register_mysql(void)
 		{ "Days", "mysql.exec.field.time.days",
 		FT_INT32, BASE_DEC, NULL, 0x0,
 		NULL, HFILL }},
+
+		//TODO: does wireshark allow hyphens in field names?
+		{ &hf_mysql_slave_server_id,
+		{ "Slave server-id", "mysql.slave.server_id",
+		FT_UINT32, BASE_DEC, NULL, 0x0,
+		NULL, HFILL }},
+
+		{ &hf_mysql_slave_hostname,
+		{ "Slave hostname", "mysql.slave.hostname",
+		FT_STRING, BASE_NONE, NULL, 0x0,
+		NULL, HFILL }},
+
+		{ &hf_mysql_slave_user,
+		{ "Slave user", "mysql.slave.user",
+		FT_STRING, BASE_NONE, NULL, 0x0,
+		NULL, HFILL }},
+
+		{ &hf_mysql_slave_password,
+		{ "Slave password", "mysql.slave.password",
+		FT_STRING, BASE_NONE, NULL, 0x0,
+		NULL, HFILL }},
+
+		{ &hf_mysql_slave_port,
+		{ "Slave port", "mysql.slave.port",
+		FT_UINT16, BASE_DEC, NULL, 0x0,
+		NULL, HFILL }},
+
+		{ &hf_mysql_slave_replication_rank,
+		{ "Slave replication rank", "mysql.slave.replication_rank",
+		FT_UINT32, BASE_DEC, NULL, 0x0,
+		NULL, HFILL }},
+
+		{ &hf_mysql_slave_master_id,
+		{ "Slave master-id", "mysql.slave.master_id",
+		FT_UINT32, BASE_DEC, NULL, 0x0,
+		NULL, HFILL }},
+
 	};
 
 	static gint *ett[]=
