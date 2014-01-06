@@ -85,12 +85,12 @@ void proto_reg_handoff_mysql(void);
 #define MYSQL_FLD_SET_FLAG            0x0800
 
 /* extended capabilities: 4.1+ client only */
-#define MYSQL_CAPS_MS 0x0001 //
-#define MYSQL_CAPS_MR 0x0002
-#define MYSQL_CAPS_PS_MULTI_RESULTS               0x0004
-#define MYSQL_CAPS_PLUGIN_AUTH                    0x0008
-#define MYSQL_CAPS_CONNECT_ATTRS                  0x0010
-#define MYSQL_CAPS_PLUGIN_AUTH_LENENC_CLIENT_DATA 0x0020
+#define MYSQL_CAPS_MS  0x0001
+#define MYSQL_CAPS_MR  0x0002
+#define MYSQL_CAPS_PMR 0x0004
+#define MYSQL_CAPS_PA  0x0008
+#define MYSQL_CAPS_CA  0x0010
+#define MYSQL_CAPS_AL  0x0020
 
 
 /* status bitfield */
@@ -410,9 +410,15 @@ static int hf_mysql_cap_ignore_sigpipe = -1;
 static int hf_mysql_cap_transactions = -1;
 static int hf_mysql_cap_reserved = -1;
 static int hf_mysql_cap_secure_connect = -1;
+static int hf_mysql_extcaps_server = -1;
 static int hf_mysql_extcaps_client = -1;
 static int hf_mysql_cap_multi_statements = -1;
 static int hf_mysql_cap_multi_results = -1;
+static int hf_mysql_cap_ps_multi_results = -1;
+static int hf_mysql_cap_plugin_auth = -1;
+static int hf_mysql_cap_connect_attrs = -1;
+static int hf_mysql_cap_plugin_auth_lenenc_client_data = -1;
+
 static int hf_mysql_server_language = -1;
 static int hf_mysql_server_status = -1;
 static int hf_mysql_stat_it = -1;
@@ -609,6 +615,7 @@ static const value_string state_vals[] = {
 
 typedef struct mysql_conn_data {
 	guint16 srv_caps;
+	guint16 srv_caps_ext;
 	guint16 clnt_caps;
 	guint16 clnt_caps_ext;
 	mysql_state_t state;
@@ -642,6 +649,7 @@ static int mysql_dissect_ok_packet(tvbuff_t *tvb, packet_info *pinfo, int offset
 static int mysql_dissect_server_status(tvbuff_t *tvb, int offset, proto_tree *tree);
 static int mysql_dissect_caps_server(tvbuff_t *tvb, int offset, proto_tree *tree, guint16 *caps);
 static int mysql_dissect_caps_client(tvbuff_t *tvb, int offset, proto_tree *tree, guint16 *caps);
+static int mysql_dissect_ext_caps_server(tvbuff_t *tvb, int offset, proto_tree *tree, guint16 *caps);
 static int mysql_dissect_ext_caps_client(tvbuff_t *tvb, int offset, proto_tree *tree, guint16 *caps);
 static int mysql_dissect_result_header(tvbuff_t *tvb, packet_info *pinfo, int offset, proto_tree *tree, mysql_conn_data_t *conn_data);
 static int mysql_dissect_field_packet(tvbuff_t *tvb, int offset, proto_tree *tree, mysql_conn_data_t *conn_data);
@@ -730,6 +738,7 @@ mysql_dissect_greeting(tvbuff_t *tvb, packet_info *pinfo, int offset,
 	offset += 4;
 
 	/* salt string */
+	// now called 'auth-plugin-data-part-1'
 	lenstr = tvb_strsize(tvb,offset);
 	proto_tree_add_item(greeting_tree, hf_mysql_salt, tvb, offset, lenstr, ENC_ASCII|ENC_NA);
 	offset += lenstr;
@@ -748,15 +757,31 @@ mysql_dissect_greeting(tvbuff_t *tvb, packet_info *pinfo, int offset,
 
 	offset = mysql_dissect_server_status(tvb, offset, greeting_tree);
 
-	/* 13 bytes unused */
-	proto_tree_add_item(greeting_tree, hf_mysql_unused, tvb, offset, 13, ENC_ASCII|ENC_NA);
-	offset += 13;
+	offset = mysql_dissect_ext_caps_server(tvb, offset, greeting_tree, &conn_data->srv_caps_ext);
 
-	/* 4.1+ server: rest of salt */
-	if (tvb_reported_length_remaining(tvb, offset)) {
-		lenstr = tvb_strsize(tvb,offset);
-		proto_tree_add_item(greeting_tree, hf_mysql_salt2, tvb, offset, lenstr, ENC_ASCII|ENC_NA);
+	if(conn_data->srv_caps_ext & MYSQL_CAPS_PA) {
+		tvb_memcpy(tvb, &lenstr, offset, 1);
+
+		//We already have 8 bytes of auth-plugin-data, and there is a
+		//minimum of 13 bytes for part 2
+		lenstr -= 8;
+                lenstr = (lenstr < 13) ? 13 : lenstr;
+	}
+	offset += 11;
+
+	if(conn_data->srv_caps_ext & MYSQL_CAPS_SC) {
+		proto_tree_add_item(greeting_tree, hf_mysql_salt2, tvb, offset, lenstr, ENC_NA);
 		offset += lenstr;
+	}
+
+	if(conn_data->srv_caps_ext & MYSQL_CAPS_PA) {
+		/* auth-plugin-name is "NULL terminated", but they didn't add the
+		NULL byte in versions prior to 5.5.10 and 5.6.2
+		see http://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::Handshake
+		and http://bugs.mysql.com/bug.php?id=59453 */
+		lenstr = my_tvb_strsize(tvb, offset);
+		proto_tree_add_item(greeting_tree, hf_mysql_auth_plugin_name, tvb, offset, lenstr, ENC_UTF_8);
+                offset += lenstr;
 	}
 
 	return offset;
@@ -834,14 +859,14 @@ mysql_dissect_login(tvbuff_t *tvb, packet_info *pinfo, int offset,
 		offset += lenstr;
 	}
 
-	if (conn_data->clnt_caps & MYSQL_CAPS_PLUGIN_AUTH)
+	if (conn_data->clnt_caps_ext & MYSQL_CAPS_PA)
 	{
-		lenstr=my_tvb_strsize(tvb, offset);
+		lenstr = my_tvb_strsize(tvb, offset);
 		if(lenstr < 0) {
 			return offset;
 		}
 
-		proto_tree_add_item(login_tree, hf_mysql_auth_plugin_name, tvb, offset, lenstr, ENC_ASCII);
+		proto_tree_add_item(login_tree, hf_mysql_auth_plugin_name, tvb, offset, lenstr, ENC_UTF_8);
 		offset += lenstr;
 	}
 
@@ -1594,6 +1619,30 @@ mysql_dissect_caps_client(tvbuff_t *tvb, int offset, proto_tree *tree, guint16 *
 	offset += 2;
 	return offset;
 }
+
+
+static int
+mysql_dissect_ext_caps_server(tvbuff_t *tvb, int offset, proto_tree *tree, guint16 *ext_caps)
+{
+	proto_item *tf;
+	proto_item *extcap_tree;
+	*ext_caps= tvb_get_letohs(tvb, offset);
+	if (tree) {
+		tf = proto_tree_add_item(tree, hf_mysql_extcaps_server, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+		extcap_tree = proto_item_add_subtree(tf, ett_extcaps);
+		proto_tree_add_item(extcap_tree, hf_mysql_cap_multi_statements, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+		proto_tree_add_item(extcap_tree, hf_mysql_cap_multi_results, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+		proto_tree_add_item(extcap_tree, hf_mysql_cap_ps_multi_results, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+		proto_tree_add_item(extcap_tree, hf_mysql_cap_plugin_auth, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+		proto_tree_add_item(extcap_tree, hf_mysql_cap_connect_attrs, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+		proto_tree_add_item(extcap_tree, hf_mysql_cap_plugin_auth_lenenc_client_data, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+	}
+
+	offset += 2;
+	return offset;
+}
+
+
 static int
 mysql_dissect_ext_caps_client(tvbuff_t *tvb, int offset, proto_tree *tree, guint16 *ext_caps)
 {
@@ -1605,6 +1654,10 @@ mysql_dissect_ext_caps_client(tvbuff_t *tvb, int offset, proto_tree *tree, guint
 		extcap_tree = proto_item_add_subtree(tf, ett_extcaps);
 		proto_tree_add_item(extcap_tree, hf_mysql_cap_multi_statements, tvb, offset, 2, ENC_LITTLE_ENDIAN);
 		proto_tree_add_item(extcap_tree, hf_mysql_cap_multi_results, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+		proto_tree_add_item(extcap_tree, hf_mysql_cap_ps_multi_results, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+		proto_tree_add_item(extcap_tree, hf_mysql_cap_plugin_auth, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+		proto_tree_add_item(extcap_tree, hf_mysql_cap_connect_attrs, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+		proto_tree_add_item(extcap_tree, hf_mysql_cap_plugin_auth_lenenc_client_data, tvb, offset, 2, ENC_LITTLE_ENDIAN);
 	}
 
 	offset += 2;
@@ -2161,6 +2214,11 @@ void proto_register_mysql(void)
 		FT_BOOLEAN, 16, TFS(&tfs_set_notset), MYSQL_CAPS_SC,
 		NULL, HFILL }},
 
+		{ &hf_mysql_extcaps_server,
+		{ "Extended Server Capabilities", "mysql.extcaps.server",
+		FT_UINT16, BASE_HEX, NULL, 0x0,
+		"MySQL Extended Capabilities", HFILL }},
+
 		{ &hf_mysql_extcaps_client,
 		{ "Extended Client Capabilities", "mysql.extcaps.client",
 		FT_UINT16, BASE_HEX, NULL, 0x0,
@@ -2174,6 +2232,26 @@ void proto_register_mysql(void)
 		{ &hf_mysql_cap_multi_results,
 		{ "Supports multiple results","mysql.caps.mr",
 		FT_BOOLEAN, 16, TFS(&tfs_set_notset), MYSQL_CAPS_MR,
+		NULL, HFILL }},
+
+		{ &hf_mysql_cap_ps_multi_results,
+		{ "Supports multiple results from prepared statments", "mysql.caps.pmr",
+		FT_BOOLEAN, 16, TFS(&tfs_set_notset), MYSQL_CAPS_PMR,
+		NULL, HFILL }},
+
+		{ &hf_mysql_cap_plugin_auth,
+		{ "Supports authentication plugins", "mysql.caps.pa",
+		FT_BOOLEAN, 16, TFS(&tfs_set_notset), MYSQL_CAPS_PA,
+		NULL, HFILL }},
+
+		{ &hf_mysql_cap_connect_attrs,
+		{ "Allows connection attributes in login request", "mysql.caps.ca",
+		FT_BOOLEAN, 16, TFS(&tfs_set_notset), MYSQL_CAPS_CA,
+		NULL, HFILL }},
+
+		{ &hf_mysql_cap_plugin_auth_lenenc_client_data,
+		{ "Understands length-encoded integer length for auth response data", "mysql.caps.al",
+		FT_BOOLEAN, 16, TFS(&tfs_set_notset), MYSQL_CAPS_AL,
 		NULL, HFILL }},
 
 		{ &hf_mysql_login_request,
