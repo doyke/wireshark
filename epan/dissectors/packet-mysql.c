@@ -383,9 +383,11 @@ static const value_string mysql_option_vals[] = {
 	{0, NULL}
 };
 
+#define QUERY_EVENT 0x02
+
 static const value_string mysql_binlog_event_vals[] = {
 	{0x01, "START_EVENT_V3"},
-	{0x02, "QUERY_EVENT"},
+	{QUERY_EVENT, "QUERY_EVENT"},
 	{0x03, "STOP_EVENT"},
 	{0x04, "ROTATE_EVENT"},
 	{0x05, "INTVAR_EVENT"},
@@ -439,6 +441,7 @@ static gint ett_request = -1;
 static gint ett_refresh = -1;
 static gint ett_field_flags = -1;
 static gint ett_exec_param = -1;
+static gint ett_binlog_event = -1;
 static gint ett_binlog_flags = -1;
 
 /* protocol fields */
@@ -590,6 +593,7 @@ static int hf_mysql_slave_password = -1;
 static int hf_mysql_slave_port = -1;
 static int hf_mysql_slave_replication_rank = -1;
 static int hf_mysql_slave_master_id = -1;
+static int hf_mysql_binlog_event = -1;
 static int hf_mysql_binlog_timestamp = -1;
 static int hf_mysql_binlog_type = -1;
 static int hf_mysql_binlog_server_id = -1;
@@ -606,6 +610,7 @@ static int hf_mysql_binlog_relay_log = -1;
 static int hf_mysql_binlog_ignorable = -1;
 static int hf_mysql_binlog_no_filter = -1;
 static int hf_mysql_binlog_mts_isolate = -1;
+static int hf_mysql_binlog_data = -1;
 
 
 static expert_field ei_mysql_eof = EI_INIT;
@@ -1573,23 +1578,28 @@ mysql_dissect_binlog_dump_packet(tvbuff_t *tvb, int offset, proto_tree *tree)
 {
 	proto_item *tf;
 	proto_item *flags_tree;
+	proto_item *binlog_tree;
+        gint len = tvb_reported_length_remaining(tvb, offset);
 
-	proto_tree_add_item(tree, hf_mysql_binlog_timestamp, tvb, offset, 4, ENC_LITTLE_ENDIAN);
+        tf = proto_tree_add_item(tree, hf_mysql_binlog_event, tvb, offset, len, ENC_NA);
+	binlog_tree = proto_item_add_subtree(tf, ett_binlog_event);
+
+	proto_tree_add_item(binlog_tree, hf_mysql_binlog_timestamp, tvb, offset, 4, ENC_LITTLE_ENDIAN);
 	offset += 4;
 
-	proto_tree_add_item(tree, hf_mysql_binlog_type, tvb, offset, 1, ENC_LITTLE_ENDIAN);
+	proto_tree_add_item(binlog_tree, hf_mysql_binlog_type, tvb, offset, 1, ENC_LITTLE_ENDIAN);
 	offset += 1;
 
-	proto_tree_add_item(tree, hf_mysql_binlog_server_id, tvb, offset, 4, ENC_LITTLE_ENDIAN);
+	proto_tree_add_item(binlog_tree, hf_mysql_binlog_server_id, tvb, offset, 4, ENC_LITTLE_ENDIAN);
 	offset += 4;
 
-	proto_tree_add_item(tree, hf_mysql_binlog_length, tvb, offset, 4, ENC_LITTLE_ENDIAN);
+	proto_tree_add_item(binlog_tree, hf_mysql_binlog_length, tvb, offset, 4, ENC_LITTLE_ENDIAN);
 	offset += 4;
 
-	proto_tree_add_item(tree, hf_mysql_binlog_next_position, tvb, offset, 4, ENC_LITTLE_ENDIAN);
+	proto_tree_add_item(binlog_tree, hf_mysql_binlog_next_position, tvb, offset, 4, ENC_LITTLE_ENDIAN);
 	offset += 4;
 
-	tf = proto_tree_add_item(tree, hf_mysql_binlog_flags, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+	tf = proto_tree_add_item(binlog_tree, hf_mysql_binlog_flags, tvb, offset, 2, ENC_LITTLE_ENDIAN);
 	flags_tree = proto_item_add_subtree(tf, ett_binlog_flags);
 	proto_tree_add_item(flags_tree, hf_mysql_binlog_in_use, tvb, offset, 2, ENC_LITTLE_ENDIAN);
 	proto_tree_add_item(flags_tree, hf_mysql_binlog_forced_rotate, tvb, offset, 2, ENC_LITTLE_ENDIAN);
@@ -1603,7 +1613,9 @@ mysql_dissect_binlog_dump_packet(tvbuff_t *tvb, int offset, proto_tree *tree)
 	proto_tree_add_item(flags_tree, hf_mysql_binlog_mts_isolate, tvb, offset, 2, ENC_LITTLE_ENDIAN);
 	offset += 2;
 
-	offset += tvb_reported_length_remaining(tvb, offset);
+        len = tvb_reported_length_remaining(tvb, offset);
+        proto_tree_add_item(binlog_tree, hf_mysql_binlog_data, tvb, offset, len, ENC_NA);
+	offset += len;
 	return offset;
 }
 
@@ -2919,38 +2931,43 @@ void proto_register_mysql(void)
 		FT_UINT32, BASE_DEC, NULL, 0x0,
 		NULL, HFILL }},
 
-                { &hf_mysql_binlog_timestamp,
-                { "Binlog event timestamp", "mysql.binlog.timestamp",
-                FT_UINT32, BASE_DEC, NULL, 0x0,
-                NULL, HFILL }},
+		{ &hf_mysql_binlog_event,
+		{ "Binlog event", "mysql.binlog",
+		FT_NONE, BASE_NONE, NULL, 0x0,
+		NULL, HFILL }},
 
-                { &hf_mysql_binlog_type,
-                { "Binlog event type", "mysql.binlog.type",
-                FT_UINT8, BASE_DEC, VALS(mysql_binlog_event_vals), 0x0,
-                NULL, HFILL }},
+		{ &hf_mysql_binlog_timestamp,
+		{ "Timestamp", "mysql.binlog.timestamp",
+		FT_UINT32, BASE_DEC, NULL, 0x0,
+		NULL, HFILL }},
 
-                { &hf_mysql_binlog_server_id,
-                { "Binlog event server-id", "mysql.binlog.server-id",
-                FT_UINT32, BASE_DEC, NULL, 0x0,
-                NULL, HFILL }},
+		{ &hf_mysql_binlog_type,
+		{ "Event type", "mysql.binlog.type",
+		FT_UINT8, BASE_DEC, VALS(mysql_binlog_event_vals), 0x0,
+		NULL, HFILL }},
 
-                { &hf_mysql_binlog_length,
-                { "Binlog event length", "mysql.binlog.length",
-                FT_UINT32, BASE_DEC, NULL, 0x0,
-                NULL, HFILL }},
+		{ &hf_mysql_binlog_server_id,
+		{ "Server ID", "mysql.binlog.server-id",
+		FT_UINT32, BASE_DEC, NULL, 0x0,
+		NULL, HFILL }},
 
-                { &hf_mysql_binlog_next_position,
-                { "Binlog next event position", "mysql.binlog.next-position",
-                FT_UINT32, BASE_DEC, NULL, 0x0,
-                NULL, HFILL }},
+		{ &hf_mysql_binlog_length,
+		{ "Event length", "mysql.binlog.length",
+		FT_UINT32, BASE_DEC, NULL, 0x0,
+		NULL, HFILL }},
+
+		{ &hf_mysql_binlog_next_position,
+		{ "Next event position", "mysql.binlog.next-position",
+		FT_UINT32, BASE_DEC, NULL, 0x0,
+		NULL, HFILL }},
 
 		{ &hf_mysql_binlog_flags,
-		{ "Binlog event flags", "mysql.binlog.flags",
+		{ "Flags", "mysql.binlog.flags",
 		FT_UINT16, BASE_HEX, NULL, 0x0,
 		NULL, HFILL }},
 
 		{ &hf_mysql_binlog_in_use,
-		{ "Binlog in use", "mysql.binlog.flags.in_use",
+		{ "In use", "mysql.binlog.flags.in_use",
 		FT_BOOLEAN, 16, TFS(&tfs_set_notset), MYSQL_BL_BINLOG_IN_USE,
 		NULL, HFILL }},
 
@@ -2998,6 +3015,11 @@ void proto_register_mysql(void)
 		{ "MTS Isolate", "mysql.binlog.flags.mts_isolate",
 		FT_BOOLEAN, 16, TFS(&tfs_set_notset), MYSQL_BL_MTS_ISOLATE,
 		NULL, HFILL }},
+
+		{ &hf_mysql_binlog_data,
+		{ "Event data", "mysql.binlog.data",
+		FT_BYTES, BASE_NONE, NULL, 0x0,
+		NULL, HFILL }},
 	};
 
 	static gint *ett[]=
@@ -3012,7 +3034,8 @@ void proto_register_mysql(void)
 		&ett_refresh,
 		&ett_field_flags,
 		&ett_exec_param,
-		&ett_binlog_flags
+		&ett_binlog_event,
+		&ett_binlog_flags,
 	};
 
 	static ei_register_info ei[] = {
