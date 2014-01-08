@@ -383,13 +383,16 @@ static const value_string mysql_option_vals[] = {
 	{0, NULL}
 };
 
-#define QUERY_EVENT 0x02
+#define MYSQL_QUERY_EVENT              0x02
+#define MYSQL_ROTATE_EVENT             0x04
+#define MYSQL_FORMAT_DESCRIPTION_EVENT 0x0f
+#define MYSQL_HEARTBEAT_EVENT          0x1b
 
 static const value_string mysql_binlog_event_vals[] = {
 	{0x01, "START_EVENT_V3"},
-	{QUERY_EVENT, "QUERY_EVENT"},
+	{MYSQL_QUERY_EVENT, "QUERY_EVENT"},
 	{0x03, "STOP_EVENT"},
-	{0x04, "ROTATE_EVENT"},
+	{MYSQL_ROTATE_EVENT, "ROTATE_EVENT"},
 	{0x05, "INTVAR_EVENT"},
 	{0x06, "LOAD_EVENT"},
 	{0x07, "SLAVE_EVENT"},
@@ -400,7 +403,7 @@ static const value_string mysql_binlog_event_vals[] = {
 	{0x0c, "NEW_LOAD_EVENT"},
 	{0x0d, "RAND_EVENT"},
 	{0x0e, "USER_VAR_EVENT"},
-	{0x0f, "FORMAT_DESCRIPTION_EVENT"},
+	{MYSQL_FORMAT_DESCRIPTION_EVENT, "FORMAT_DESCRIPTION_EVENT"},
 	{0x10, "XID_EVENT"},
 	{0x11, "BEGIN_LOAD_QUERY_EVENT"},
 	{0x12, "EXECUTE_LOAD_QUERY_EVENT"},
@@ -412,7 +415,7 @@ static const value_string mysql_binlog_event_vals[] = {
 	{0x18, "UPDATE_ROWS_EVENTv1"},
 	{0x19, "DELETE_ROWS_EVENTv1"},
 	{0x1a, "INCIDENT_EVENT"},
-	{0x1b, "HEARTBEAT_EVENT"},
+	{MYSQL_HEARTBEAT_EVENT, "HEARTBEAT_EVENT"},
 	{0x1c, "IGNORABLE_EVENT"},
 	{0x1d, "ROWS_QUERY_EVENT"},
 	{0x1e, "WRITE_ROWS_EVENTv2"},
@@ -443,6 +446,7 @@ static gint ett_field_flags = -1;
 static gint ett_exec_param = -1;
 static gint ett_binlog_event = -1;
 static gint ett_binlog_flags = -1;
+static gint ett_binlog_data = -1;
 
 /* protocol fields */
 static int hf_mysql_caps_server = -1;
@@ -593,6 +597,7 @@ static int hf_mysql_slave_password = -1;
 static int hf_mysql_slave_port = -1;
 static int hf_mysql_slave_replication_rank = -1;
 static int hf_mysql_slave_master_id = -1;
+
 static int hf_mysql_binlog_event = -1;
 static int hf_mysql_binlog_timestamp = -1;
 static int hf_mysql_binlog_type = -1;
@@ -610,7 +615,25 @@ static int hf_mysql_binlog_relay_log = -1;
 static int hf_mysql_binlog_ignorable = -1;
 static int hf_mysql_binlog_no_filter = -1;
 static int hf_mysql_binlog_mts_isolate = -1;
-static int hf_mysql_binlog_data = -1;
+static int hf_mysql_binlog_query = -1;
+static int hf_mysql_binlog_thread_id = -1;
+static int hf_mysql_binlog_exec_time = -1;
+static int hf_mysql_binlog_error_code = -1;
+
+static int hf_mysql_binlog_query_status = -1;
+static int hf_mysql_binlog_query_schema = -1;
+static int hf_mysql_binlog_query_text = -1;
+
+static int hf_mysql_binlog_rotate_position = -1;
+static int hf_mysql_binlog_rotate_file = -1;
+
+static int hf_mysql_binlog_fde_version = -1;
+static int hf_mysql_binlog_fde_server_version = -1;
+static int hf_mysql_binlog_fde_timestamp = -1;
+static int hf_mysql_binlog_fde_header_length = -1;
+static int hf_mysql_binlog_fde_event_header_lengths = -1;
+
+static int hf_mysql_binlog_heartbeat_ident = -1;
 
 
 static expert_field ei_mysql_eof = EI_INIT;
@@ -720,7 +743,7 @@ typedef struct mysql_exec_dissector {
 /* function prototypes */
 static int mysql_dissect_error_packet(tvbuff_t *tvb, packet_info *pinfo, int offset, proto_tree *tree);
 static int mysql_dissect_ok_packet(tvbuff_t *tvb, packet_info *pinfo, int offset, proto_tree *tree, mysql_conn_data_t *conn_data);
-static int mysql_dissect_binlog_dump_packet(tvbuff_t *tvb, int offset, proto_tree *tree);
+static int mysql_dissect_binlog_dump_packet(tvbuff_t *tvb, packet_info *pinfo, int offset, proto_tree *tree);
 static int mysql_dissect_server_status(tvbuff_t *tvb, int offset, proto_tree *tree);
 static int mysql_dissect_caps_server(tvbuff_t *tvb, int offset, proto_tree *tree, guint16 *caps);
 static int mysql_dissect_caps_client(tvbuff_t *tvb, int offset, proto_tree *tree, guint16 *caps);
@@ -1500,7 +1523,7 @@ mysql_dissect_response(tvbuff_t *tvb, packet_info *pinfo, int offset,
 
 			if (is_binlog_dump) {
 				offset += 1;
-				offset = mysql_dissect_binlog_dump_packet(tvb, offset, tree);
+				offset = mysql_dissect_binlog_dump_packet(tvb, pinfo, offset, tree);
 			} else if (length_remaining > tvb_get_fle(tvb, offset+1, NULL, NULL)) {
 				offset = mysql_dissect_ok_packet(tvb, pinfo, offset+1, tree, conn_data);
 			} else {
@@ -1574,19 +1597,104 @@ mysql_dissect_error_packet(tvbuff_t *tvb, packet_info *pinfo,
 
 
 static int
-mysql_dissect_binlog_dump_packet(tvbuff_t *tvb, int offset, proto_tree *tree)
+mysql_dissect_binlog_data(guint8 type, tvbuff_t *tvb, int offset, proto_tree *tree)
 {
-	proto_item *tf;
-	proto_item *flags_tree;
-	proto_item *binlog_tree;
-        gint len = tvb_reported_length_remaining(tvb, offset);
+	guint8 schema_lenstr;
+        guint16 status_lenstr;
+	guint accum;
 
-        tf = proto_tree_add_item(tree, hf_mysql_binlog_event, tvb, offset, len, ENC_NA);
+	switch (type) {
+	case MYSQL_QUERY_EVENT:
+		proto_tree_add_item(tree, hf_mysql_binlog_thread_id, tvb, offset, 4, ENC_LITTLE_ENDIAN);
+		offset += 4;
+		proto_tree_add_item(tree, hf_mysql_binlog_exec_time, tvb, offset, 4, ENC_LITTLE_ENDIAN);
+		offset += 4;
+
+		schema_lenstr = tvb_get_guint8(tvb, offset);
+		offset += 1;
+
+		proto_tree_add_item(tree, hf_mysql_binlog_error_code, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+		offset += 2;
+
+		/* Read these two bytes and see if it makes sense to interpret them as the length of the status field */
+		status_lenstr = tvb_get_letohs(tvb, offset);
+		accum = offset + 2 + schema_lenstr + status_lenstr;
+		if(tvb_reported_length_remaining(tvb, accum) > 0 &&
+			tvb_get_guint8(tvb, accum) == 0)
+		{
+			/* Then we found a zero byte right where it should be in binlog version >= 4 */
+
+			/* Mark the status_lenstr as read */
+			offset += 2;
+
+			proto_tree_add_item(tree, hf_mysql_binlog_query_status, tvb, offset, status_lenstr, ENC_NA);
+			offset += status_lenstr;
+
+			proto_tree_add_item(tree, hf_mysql_binlog_query_schema, tvb, offset, schema_lenstr, ENC_ASCII);
+			offset += schema_lenstr;
+
+			/* Skip the zero byte after the schema string */
+			offset += 1;
+
+			accum = my_tvb_strsize(tvb, offset);
+			proto_tree_add_item(tree, hf_mysql_binlog_query_text, tvb, offset, accum, ENC_ASCII);
+			offset += accum;
+		}
+		break;
+	case MYSQL_ROTATE_EVENT:
+		proto_tree_add_item(tree, hf_mysql_binlog_rotate_position, tvb, offset, 8, ENC_LITTLE_ENDIAN);
+		offset += 8;
+
+		accum = tvb_reported_length_remaining(tvb, offset);
+		proto_tree_add_item(tree, hf_mysql_binlog_rotate_file, tvb, offset, accum, ENC_ASCII);
+		offset += accum;
+		break;
+	case MYSQL_FORMAT_DESCRIPTION_EVENT:
+		proto_tree_add_item(tree, hf_mysql_binlog_fde_version, tvb, offset, 2, ENC_LITTLE_ENDIAN);
+		offset += 2;
+
+		proto_tree_add_item(tree, hf_mysql_binlog_fde_server_version, tvb, offset, 50, ENC_LITTLE_ENDIAN);
+		offset += 50;
+
+		proto_tree_add_item(tree, hf_mysql_binlog_fde_timestamp, tvb, offset, 4, ENC_LITTLE_ENDIAN);
+		offset += 4;
+
+		proto_tree_add_item(tree, hf_mysql_binlog_fde_header_length, tvb, offset, 1, ENC_NA);
+		offset += 1;
+
+		accum = tvb_reported_length_remaining(tvb, offset);
+		proto_tree_add_item(tree, hf_mysql_binlog_fde_event_header_lengths, tvb, offset, accum, ENC_NA);
+		offset += accum;
+		break;
+	case MYSQL_HEARTBEAT_EVENT:
+		accum = tvb_reported_length_remaining(tvb, offset);
+		proto_tree_add_item(tree, hf_mysql_binlog_heartbeat_ident, tvb, offset, accum, ENC_ASCII);
+		offset += accum;
+		break;
+	default:
+		offset += tvb_reported_length_remaining(tvb, offset);
+	}
+
+	return offset;
+}
+
+
+static int
+mysql_dissect_binlog_dump_packet(tvbuff_t *tvb, packet_info *pinfo, int offset, proto_tree *tree)
+{
+	proto_item *tf, *flags_tree, *binlog_tree, *binlog_data_tree;
+	gint len = tvb_reported_length_remaining(tvb, offset);
+        guint8 type;
+
+	col_append_str(pinfo->cinfo, COL_INFO, " Binlog" );
+
+	tf = proto_tree_add_item(tree, hf_mysql_binlog_event, tvb, offset, len, ENC_NA);
 	binlog_tree = proto_item_add_subtree(tf, ett_binlog_event);
 
 	proto_tree_add_item(binlog_tree, hf_mysql_binlog_timestamp, tvb, offset, 4, ENC_LITTLE_ENDIAN);
 	offset += 4;
 
+	type = tvb_get_guint8(tvb, offset);
 	proto_tree_add_item(binlog_tree, hf_mysql_binlog_type, tvb, offset, 1, ENC_LITTLE_ENDIAN);
 	offset += 1;
 
@@ -1613,11 +1721,12 @@ mysql_dissect_binlog_dump_packet(tvbuff_t *tvb, int offset, proto_tree *tree)
 	proto_tree_add_item(flags_tree, hf_mysql_binlog_mts_isolate, tvb, offset, 2, ENC_LITTLE_ENDIAN);
 	offset += 2;
 
-        len = tvb_reported_length_remaining(tvb, offset);
-        proto_tree_add_item(binlog_tree, hf_mysql_binlog_data, tvb, offset, len, ENC_NA);
-	offset += len;
-	return offset;
+	len = tvb_reported_length_remaining(tvb, offset);
+	tf = proto_tree_add_item(binlog_tree, hf_mysql_binlog_query, tvb, offset, len, ENC_NA);
+	binlog_data_tree = proto_item_add_subtree(tf, ett_binlog_data);
+	return mysql_dissect_binlog_data(type, tvb, offset, binlog_data_tree);
 }
+
 
 static int
 mysql_dissect_ok_packet(tvbuff_t *tvb, packet_info *pinfo, int offset,
@@ -3016,9 +3125,80 @@ void proto_register_mysql(void)
 		FT_BOOLEAN, 16, TFS(&tfs_set_notset), MYSQL_BL_MTS_ISOLATE,
 		NULL, HFILL }},
 
-		{ &hf_mysql_binlog_data,
-		{ "Event data", "mysql.binlog.data",
+		{ &hf_mysql_binlog_query,
+		{ "Event data", "mysql.binlog.query",
+		FT_NONE, BASE_NONE, NULL, 0x0,
+		NULL, HFILL }},
+
+		{ &hf_mysql_binlog_thread_id,
+		{ "Thread ID", "mysql.binlog.query.thread_id",
+		FT_UINT32, BASE_DEC, NULL, 0x0,
+		NULL, HFILL }},
+
+		{ &hf_mysql_binlog_exec_time,
+		{ "Execution time", "mysql.binlog.query.exec_time",
+		FT_INT32, BASE_DEC, NULL, 0x0,
+		NULL, HFILL }},
+
+		{ &hf_mysql_binlog_error_code,
+		{ "Error code", "mysql.binlog.query.error_code",
+		FT_UINT16, BASE_DEC, NULL, 0x0,
+		NULL, HFILL }},
+
+		{ &hf_mysql_binlog_query_status,
+		{ "Status", "mysql.binlog.query.status",
+		FT_NONE, BASE_NONE, NULL, 0x0,
+		NULL, HFILL }},
+
+		{ &hf_mysql_binlog_query_schema,
+		{ "Schema", "mysql.binlog.query.schema",
+		FT_STRING, BASE_NONE, NULL, 0x0,
+		NULL, HFILL }},
+
+		{ &hf_mysql_binlog_query_text,
+		{ "Text", "mysql.binlog.query.text",
+		FT_STRING, BASE_NONE, NULL, 0x0,
+		NULL, HFILL }},
+
+		// If only there were an FT_UINT128
+		{ &hf_mysql_binlog_rotate_position,
+		{ "Position", "mysql.binlog.rotate.position",
 		FT_BYTES, BASE_NONE, NULL, 0x0,
+		NULL, HFILL }},
+
+		{ &hf_mysql_binlog_rotate_file,
+		{ "Filename", "mysql.binlog.rotate.file",
+		FT_STRING, BASE_NONE, NULL, 0x0,
+		NULL, HFILL }},
+
+		{ &hf_mysql_binlog_fde_version,
+		{ "Binlog Version", "mysql.binlog.fde.version",
+		FT_UINT16, BASE_DEC, NULL, 0x0,
+		NULL, HFILL }},
+
+		{ &hf_mysql_binlog_fde_server_version,
+		{ "Server Version", "mysql.binlog.fde.server_version",
+		FT_STRINGZ, BASE_NONE, NULL, 0x0,
+		NULL, HFILL }},
+
+		{ &hf_mysql_binlog_fde_timestamp,
+		{ "Timestamp", "mysql.binlog.fde.timestamp",
+		FT_UINT32, BASE_DEC, NULL, 0x0,
+		NULL, HFILL }},
+
+		{ &hf_mysql_binlog_fde_header_length,
+		{ "Binlog event header length", "mysql.binlog.fde.header_len",
+		FT_UINT8, BASE_DEC, NULL, 0x0,
+		NULL, HFILL }},
+
+		{ &hf_mysql_binlog_fde_event_header_lengths,
+		{ "Binlog event header lengths by type", "mysql.binlog.fde.event_header_lens",
+		FT_BYTES, BASE_NONE, NULL, 0x0,
+		NULL, HFILL }},
+
+		{ &hf_mysql_binlog_heartbeat_ident,
+		{ "Log file name", "mysql.binlog.heartbeat.ident",
+		FT_STRING, BASE_NONE, NULL, 0x0,
 		NULL, HFILL }},
 	};
 
@@ -3036,6 +3216,7 @@ void proto_register_mysql(void)
 		&ett_exec_param,
 		&ett_binlog_event,
 		&ett_binlog_flags,
+		&ett_binlog_data,
 	};
 
 	static ei_register_info ei[] = {
